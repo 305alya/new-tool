@@ -412,7 +412,31 @@ with st.sidebar:
         if b and b.lower() not in [x.lower() for x in bookmakers]:
             bookmakers.append(b)
 
-    markets = st.multiselect("Markets", DEFAULT_MARKET_NAMES, default=["ML"])
+    MARKET_KEY_MAP = {
+    "ML": "h2h",
+    "Spread": "spreads",
+    "Totals": "totals",
+    "Points": "player_points",
+    "Rebounds": "player_rebounds",
+    "Assists": "player_assists",
+    "3PT Made": "player_threes",
+    "PRA": "player_points_rebounds_assists",
+    "Steals": "player_steals",
+    "Blocks": "player_blocks",
+    "Blocks + Steals": "player_blocks_steals",
+    "Turnovers": "player_turnovers",
+    "Points + Rebounds": "player_points_rebounds",
+    "Points + Assists": "player_points_assists",
+    "Rebounds + Assists": "player_rebounds_assists",
+    "Double Double": "player_double_double",
+    "Triple Double": "player_triple_double",
+}
+
+markets = st.multiselect(
+    "Markets",
+    list(MARKET_KEY_MAP.keys()),
+    default=["ML"]
+)
 
     st.subheader("Serious Play Filters")
     min_ev = st.number_input("Minimum EV %", value=3.0, step=0.5)
@@ -465,7 +489,9 @@ elif run:
                     if err:
                         errors.append(f"Event {event_id} odds: {err}")
                         continue
-                    rows = odds_response_to_rows(odds_data, sport, target_book, sharp_books, bankroll, kelly_mult, markets)
+                    selected_market_keys = [MARKET_KEY_MAP[m] for m in markets]
+
+                    rows = odds_response_to_rows(odds_data,sport,target_book,sharp_books,bankroll,kelly_mult,selected_market_keys)
                     if not rows.empty:
                         frames.append(rows)
         status.update(label="Scan complete", state="complete")
@@ -505,7 +531,8 @@ elif run:
         c3.metric("Best EV %", f"{df['ev_percent'].max():.2f}%")
         c4.metric("Best confidence", int(df["confidence_score"].max()))
 
-        tabs = st.tabs(["Serious +EV Feed", "High Probability", "Provider Value Bets", "Provider Arbitrage", "History / CLV", "Raw Odds"])
+        tabs = st.tabs(["Serious +EV Feed","High Probability","Correlation Builder","Provider Value Bets","Provider Arbitrage","History / CLV",
+        "Raw Odds"])
         display_cols = ["confidence_score", "sport", "league", "event_name", "market", "selection", "point", "sportsbook", "decimal_odds", "american_odds", "fair_prob", "fair_odds", "ev_percent", "edge_percent", "books_used", "sharp_available", "kelly_fraction", "suggested_stake", "fair_source"]
 
         with tabs[1]:
@@ -525,8 +552,26 @@ elif run:
                     "serious_plus_ev_plays.csv",
                     "text/csv"
                 )
+        with tabs[3]:
+    st.subheader("Correlation Builder")
 
-        with tabs[2]:
+    if df.empty:
+        st.info("Run a scan first.")
+    else:
+        event_choice = st.selectbox(
+            "Choose game",
+            sorted(df["event_name"].dropna().unique())
+        )
+
+        game_df = df[df["event_name"] == event_choice].copy()
+
+        anchor_choice = st.selectbox(
+            "Choose your first leg",
+            game_df["selection"].astype(str) + " - " + game_df["market"].astype(str)
+        )
+
+        st.write("Suggested correlated legs will go here.")
+        with tabs[4]:
             st.caption("Uses Odds-API.io's /value-bets endpoint when your plan/bookmaker supports it.")
             if st.button("Fetch provider value bets"):
                 vals, err, usage = fetch_value_bets(api_key, target_book, sports[0] if sports else None)
@@ -537,7 +582,7 @@ elif run:
                 else:
                     st.info("No provider value bets returned.")
 
-        with tabs[3]:
+        with tabs[5]:
             st.caption("Uses Odds-API.io's /arbitrage-bets endpoint when available for your plan/bookmakers.")
             if st.button("Fetch provider arbitrage"):
                 arbs, err, usage = fetch_arbitrage(api_key, bookmakers)
@@ -548,7 +593,7 @@ elif run:
                 else:
                     st.info("No provider arbitrage returned.")
 
-        with tabs[4]:
+        with tabs[6]:
             hist = load_history()
             if hist.empty:
                 st.info("No history saved yet. Run scans with 'Save odds snapshots' enabled.")
@@ -572,7 +617,7 @@ elif run:
                 fig = px.line(h, x="ts_dt", y="american_odds", color="sportsbook", title="Line Movement")
                 st.plotly_chart(fig, use_container_width=True)
 
-        with tabs[5]:
+        with tabs[7]:
             st.dataframe(style_ev_table(df[display_cols]), use_container_width=True, hide_index=True)
             st.download_button("Download raw odds CSV", df.to_csv(index=False).encode("utf-8"), "raw_odds.csv", "text/csv")
 else:
