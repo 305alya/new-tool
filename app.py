@@ -63,7 +63,7 @@ def parlay_prob(legs):
 # -----------------------------
 
 def get_api_key():
-    return st.secrets.get("ODDS_API_KEY", "").strip()
+    return "e8e5c1f63bc6d0f6f6f52b6d4a8f3c9f8f90d6a6aac16bcf2297ad0ce4c1e808"
 
 
 def api_get(path, params=None):
