@@ -1,15 +1,14 @@
 import itertools
-import math
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-API_BASE = "https://api.the-odds-api.com/v4"
+API_BASE = "https://api.odds-api.io/v3"
 
 
 # -----------------------------
-# Odds Math
+# ODDS MATH
 # -----------------------------
 
 def american_to_decimal(odds):
@@ -19,13 +18,6 @@ def american_to_decimal(odds):
     return 1 + 100 / abs(odds)
 
 
-def american_to_implied_prob(odds):
-    odds = float(odds)
-    if odds > 0:
-        return 100 / (odds + 100)
-    return abs(odds) / (abs(odds) + 100)
-
-
 def decimal_to_american(decimal_odds):
     decimal_odds = float(decimal_odds)
     if decimal_odds >= 2:
@@ -33,417 +25,506 @@ def decimal_to_american(decimal_odds):
     return round(-100 / (decimal_odds - 1))
 
 
-def no_vig_probs(prob_a, prob_b):
-    total = prob_a + prob_b
+def decimal_to_prob(decimal_odds):
+    return 1 / float(decimal_odds)
+
+
+def american_to_prob(odds):
+    return 1 / american_to_decimal(odds)
+
+
+def ev_percent(fair_prob, book_decimal):
+    return (fair_prob * book_decimal - 1) * 100
+
+
+def no_vig_two_way(p1, p2):
+    total = p1 + p2
     if total == 0:
         return None, None
-    return prob_a / total, prob_b / total
+    return p1 / total, p2 / total
 
 
-def ev_percent(fair_prob, sportsbook_decimal):
-    """
-    EV = probability * payout - loss probability
-    Decimal odds include stake.
-    """
-    return (fair_prob * sportsbook_decimal - 1) * 100
+def parlay_decimal(legs):
+    result = 1
+    for leg in legs:
+        result *= leg["retail_decimal"]
+    return result
 
 
-def parlay_decimal_odds(decimal_odds_list):
-    product = 1
-    for d in decimal_odds_list:
-        product *= d
-    return product
-
-
-def parlay_probability(prob_list):
-    """
-    Assumes independence. Correlation adjustment is added separately.
-    """
-    product = 1
-    for p in prob_list:
-        product *= p
-    return product
+def parlay_prob(legs):
+    result = 1
+    for leg in legs:
+        result *= leg["fair_prob"]
+    return result
 
 
 # -----------------------------
-# API
+# API HELPERS
 # -----------------------------
+
+def get_api_key():
+    return st.secrets.get("ODDS_API_KEY", "").strip()
+
+
+def api_get(path, params=None):
+    api_key = get_api_key()
+
+    if not api_key:
+        st.error("Missing API key. Add ODDS_API_KEY in Streamlit Secrets.")
+        st.stop()
+
+    params = params or {}
+    params["apiKey"] = api_key
+
+    url = f"{API_BASE}{path}"
+
+    response = requests.get(url, params=params, timeout=30)
+
+    if response.status_code == 401:
+        st.error("401 Unauthorized. Your API key is not accepted by Odds-API.io.")
+        st.stop()
+
+    if response.status_code == 404:
+        st.error(f"404 Not Found. Endpoint issue: {response.url}")
+        st.stop()
+
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(ttl=300)
+def fetch_leagues():
+    data = api_get("/leagues")
+
+    if isinstance(data, dict):
+        for key in ["data", "leagues", "results"]:
+            if key in data and isinstance(data[key], list):
+                return data[key]
+
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
+@st.cache_data(ttl=180)
+def fetch_events(sport):
+    data = api_get("/events", {"sport": sport})
+
+    if isinstance(data, dict):
+        for key in ["data", "events", "results"]:
+            if key in data and isinstance(data[key], list):
+                return data[key]
+
+    if isinstance(data, list):
+        return data
+
+    return []
+
 
 @st.cache_data(ttl=120)
-def get_sports(api_key):
-    url = f"{API_BASE}/sports"
-    params = {"apiKey": api_key}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+def fetch_event_odds(event_id):
+    possible_paths = [
+        f"/odds/{event_id}",
+        "/odds",
+    ]
 
+    for path in possible_paths:
+        try:
+            if path == "/odds":
+                data = api_get(path, {"eventId": event_id})
+            else:
+                data = api_get(path)
+            return data
+        except Exception:
+            continue
 
-@st.cache_data(ttl=120)
-def get_odds(api_key, sport_key, markets, bookmakers, odds_format="american"):
-    url = f"{API_BASE}/sports/{sport_key}/odds"
-    params = {
-        "apiKey": api_key,
-        "regions": "us,eu",
-        "markets": ",".join(markets),
-        "bookmakers": ",".join(bookmakers),
-        "oddsFormat": odds_format,
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    return None
 
 
 # -----------------------------
-# Parsing
+# NORMALIZATION
 # -----------------------------
 
-def normalize_odds(raw_events):
+def find_value(obj, possible_keys):
+    if not isinstance(obj, dict):
+        return None
+
+    for key in possible_keys:
+        if key in obj:
+            return obj[key]
+
+    return None
+
+
+def normalize_leagues(leagues):
     rows = []
 
-    for event in raw_events:
-        event_id = event.get("id")
-        home = event.get("home_team")
-        away = event.get("away_team")
-        commence_time = event.get("commence_time")
+    for item in leagues:
+        if not isinstance(item, dict):
+            continue
 
-        for book in event.get("bookmakers", []):
-            book_key = book.get("key")
-            book_title = book.get("title")
+        sport = find_value(item, ["sport", "key", "slug", "id", "league"])
+        title = find_value(item, ["title", "name", "label", "league_name"])
+        event_count = find_value(item, ["event_count", "events", "live_event_count", "count"])
 
-            for market in book.get("markets", []):
-                market_key = market.get("key")
-                last_update = market.get("last_update")
-
-                for outcome in market.get("outcomes", []):
-                    name = outcome.get("name")
-                    price = outcome.get("price")
-                    point = outcome.get("point", None)
-
-                    if price is None:
-                        continue
-
-                    rows.append({
-                        "event_id": event_id,
-                        "commence_time": commence_time,
-                        "home_team": home,
-                        "away_team": away,
-                        "matchup": f"{away} @ {home}",
-                        "book": book_key,
-                        "book_title": book_title,
-                        "market": market_key,
-                        "selection": name,
-                        "point": point,
-                        "american_odds": price,
-                        "decimal_odds": american_to_decimal(price),
-                        "implied_prob": american_to_implied_prob(price),
-                        "last_update": last_update,
-                    })
+        if sport:
+            rows.append({
+                "sport": sport,
+                "title": title or sport,
+                "event_count": event_count,
+            })
 
     return pd.DataFrame(rows)
 
 
-def market_identity(row):
-    return (
-        row["event_id"],
-        row["market"],
-        row["point"],
-    )
+def normalize_events(events):
+    rows = []
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+
+        event_id = find_value(event, ["id", "event_id", "eventId"])
+        home = find_value(event, ["home", "home_team", "homeTeam"])
+        away = find_value(event, ["away", "away_team", "awayTeam"])
+        start_time = find_value(event, ["startTime", "start_time", "commence_time", "date"])
+
+        if event_id:
+            rows.append({
+                "event_id": event_id,
+                "home_team": home,
+                "away_team": away,
+                "matchup": f"{away} @ {home}" if home and away else str(event_id),
+                "start_time": start_time,
+            })
+
+    return pd.DataFrame(rows)
 
 
-def selection_identity(row):
-    return (
-        row["event_id"],
-        row["market"],
-        row["selection"],
-        row["point"],
-    )
+def extract_odds_rows(data, event_info):
+    rows = []
+
+    if data is None:
+        return rows
+
+    possible_wrappers = ["data", "odds", "bookmakers", "markets", "results"]
+
+    def unwrap(x):
+        if isinstance(x, dict):
+            for key in possible_wrappers:
+                if key in x and isinstance(x[key], list):
+                    return x[key]
+        return x
+
+    data = unwrap(data)
+
+    if isinstance(data, dict):
+        data = [data]
+
+    if not isinstance(data, list):
+        return rows
+
+    def walk(obj, current_book=None, current_market=None):
+        if isinstance(obj, dict):
+            book = find_value(obj, ["bookmaker", "book", "sportsbook", "site", "name"]) or current_book
+            market = find_value(obj, ["market", "market_name", "marketKey", "type"]) or current_market
+
+            selection = find_value(obj, ["selection", "outcome", "name", "team", "label"])
+            price = find_value(obj, ["price", "odds", "decimal", "decimalOdds", "americanOdds"])
+            point = find_value(obj, ["point", "line", "handicap", "total"])
+
+            if selection is not None and price is not None and book is not None:
+                try:
+                    price_float = float(price)
+
+                    if price_float > 20 or price_float < -20:
+                        decimal_price = american_to_decimal(price_float)
+                        american_price = price_float
+                    else:
+                        decimal_price = price_float
+                        american_price = decimal_to_american(decimal_price)
+
+                    rows.append({
+                        "event_id": event_info["event_id"],
+                        "matchup": event_info["matchup"],
+                        "start_time": event_info["start_time"],
+                        "book": str(book).lower().replace(" ", "_"),
+                        "book_raw": str(book),
+                        "market": str(market or "unknown").lower(),
+                        "selection": str(selection),
+                        "point": point,
+                        "american_odds": american_price,
+                        "decimal_odds": decimal_price,
+                        "implied_prob": decimal_to_prob(decimal_price),
+                    })
+                except Exception:
+                    pass
+
+            for value in obj.values():
+                walk(value, book, market)
+
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, current_book, current_market)
+
+    walk(data)
+    return rows
+
+
+def load_all_odds(events_df, max_events):
+    all_rows = []
+
+    selected_events = events_df.head(max_events)
+
+    progress = st.progress(0)
+
+    for i, event in selected_events.iterrows():
+        event_info = event.to_dict()
+        odds_data = fetch_event_odds(event_info["event_id"])
+        rows = extract_odds_rows(odds_data, event_info)
+        all_rows.extend(rows)
+        progress.progress((i + 1) / len(selected_events))
+
+    return pd.DataFrame(all_rows)
 
 
 # -----------------------------
-# Fair Odds Calculation
+# VALUE / FAIR ODDS
 # -----------------------------
 
-def calculate_fair_odds(df, retail_book="fanduel", sharp_book="pinnacle"):
+def calculate_edges(df, retail_book, sharp_book):
     if df.empty:
         return pd.DataFrame()
 
-    retail = df[df["book"] == retail_book].copy()
-    sharp = df[df["book"] == sharp_book].copy()
+    retail_book = retail_book.lower().replace(" ", "_")
+    sharp_book = sharp_book.lower().replace(" ", "_")
+
+    retail = df[df["book"].str.contains(retail_book, na=False)].copy()
+    sharp = df[df["book"].str.contains(sharp_book, na=False)].copy()
 
     if retail.empty or sharp.empty:
         return pd.DataFrame()
 
     results = []
 
-    grouped = sharp.groupby(["event_id", "market", "point"], dropna=False)
+    group_cols = ["event_id", "market", "point"]
 
-    for _, group in grouped:
-        if len(group) < 2:
+    for _, sharp_group in sharp.groupby(group_cols, dropna=False):
+        if len(sharp_group) != 2:
             continue
 
-        # Only clean two-way markets for no-vig math
-        if len(group) != 2:
-            continue
+        sharp_group = sharp_group.reset_index(drop=True)
 
-        g = group.reset_index(drop=True)
-        p1 = g.loc[0, "implied_prob"]
-        p2 = g.loc[1, "implied_prob"]
-        fair1, fair2 = no_vig_probs(p1, p2)
+        p1 = sharp_group.loc[0, "implied_prob"]
+        p2 = sharp_group.loc[1, "implied_prob"]
+
+        fair1, fair2 = no_vig_two_way(p1, p2)
 
         fair_map = {
-            selection_identity(g.loc[0]): fair1,
-            selection_identity(g.loc[1]): fair2,
+            str(sharp_group.loc[0, "selection"]).lower(): fair1,
+            str(sharp_group.loc[1, "selection"]).lower(): fair2,
         }
 
-        for _, r in retail.iterrows():
-            sid = selection_identity(r)
-            if sid not in fair_map:
+        same_retail = retail[
+            (retail["event_id"] == sharp_group.loc[0, "event_id"]) &
+            (retail["market"] == sharp_group.loc[0, "market"]) &
+            (retail["point"].astype(str) == str(sharp_group.loc[0, "point"]))
+        ]
+
+        for _, r in same_retail.iterrows():
+            selection_key = str(r["selection"]).lower()
+
+            if selection_key not in fair_map:
                 continue
 
-            fair_prob = fair_map[sid]
-            sportsbook_decimal = r["decimal_odds"]
-            ev = ev_percent(fair_prob, sportsbook_decimal)
+            fair_prob = fair_map[selection_key]
+            retail_decimal = r["decimal_odds"]
 
             results.append({
-                "matchup": r["matchup"],
-                "commence_time": r["commence_time"],
                 "event_id": r["event_id"],
+                "matchup": r["matchup"],
+                "start_time": r["start_time"],
                 "market": r["market"],
                 "selection": r["selection"],
                 "point": r["point"],
-                "fanduel_american": r["american_odds"],
-                "fanduel_decimal": sportsbook_decimal,
-                "pinnacle_fair_prob": fair_prob,
+                "retail_book": r["book_raw"],
+                "sharp_book": sharp_group.loc[0, "book_raw"],
+                "retail_american": r["american_odds"],
+                "retail_decimal": retail_decimal,
+                "fair_prob": fair_prob,
+                "fair_prob_pct": fair_prob * 100,
                 "fair_american": decimal_to_american(1 / fair_prob),
-                "ev_percent": ev,
-                "implied_prob_fanduel": r["implied_prob"],
+                "ev_percent": ev_percent(fair_prob, retail_decimal),
             })
 
-    out = pd.DataFrame(results)
-
-    if out.empty:
-        return out
-
-    out["pinnacle_fair_prob_pct"] = out["pinnacle_fair_prob"] * 100
-    out["implied_prob_fanduel_pct"] = out["implied_prob_fanduel"] * 100
-
-    return out.sort_values("ev_percent", ascending=False)
+    return pd.DataFrame(results).sort_values("ev_percent", ascending=False)
 
 
 # -----------------------------
-# Correlation Logic
+# CORRELATION SLIPS
 # -----------------------------
 
 def correlation_score(legs):
-    """
-    Simple starter rules.
-    This does NOT guarantee correlation.
-    It creates reasonable same-game clusters.
-    """
-
     score = 0
 
     event_ids = [leg["event_id"] for leg in legs]
-    markets = [leg["market"] for leg in legs]
+    markets = [str(leg["market"]).lower() for leg in legs]
     selections = [str(leg["selection"]).lower() for leg in legs]
 
-    same_game_count = len(event_ids) - len(set(event_ids))
-    score += same_game_count * 2
-
-    # Totals + team/player overs often correlate positively
-    if "totals" in markets:
-        over_count = sum("over" in s for s in selections)
-        if over_count >= 1:
-            score += 2
-
-    # Spread + moneyline same side can correlate
-    if "spreads" in markets and "h2h" in markets:
+    if len(set(event_ids)) == 1:
+        score += 5
+    elif len(set(event_ids)) < len(event_ids):
         score += 2
 
-    # Too many legs from totally different games lowers correlation
-    unique_games = len(set(event_ids))
-    if unique_games == len(legs):
+    if any("total" in m or "over" in m for m in markets):
+        if any("over" in s for s in selections):
+            score += 1
+
+    if any("spread" in m or "handicap" in m for m in markets):
+        score += 1
+
+    if len(set(event_ids)) == len(event_ids):
         score -= 2
 
     return score
 
 
-def build_slips(df, category="highest_probability", slip_size=4, max_slips=10):
-    if df.empty:
+def build_slips(edges, slip_size, mode, max_slips):
+    if edges.empty:
         return pd.DataFrame()
 
-    pool = df.copy()
-
-    if category == "highest_ev":
-        pool = pool[pool["ev_percent"] > 0].sort_values("ev_percent", ascending=False)
+    if mode == "Highest EV":
+        pool = edges[edges["ev_percent"] > 0].sort_values("ev_percent", ascending=False).head(30)
     else:
-        pool = pool.sort_values("pinnacle_fair_prob", ascending=False)
-
-    pool = pool.head(25)
-
-    slips = []
+        pool = edges.sort_values("fair_prob", ascending=False).head(30)
 
     records = pool.to_dict("records")
+    slips = []
 
     for combo in itertools.combinations(records, slip_size):
-        # Avoid exact duplicate market/selection conflicts
-        selection_keys = [
-            (
-                leg["event_id"],
-                leg["market"],
-                leg["selection"],
-                leg["point"],
-            )
-            for leg in combo
-        ]
+        keys = [(x["event_id"], x["market"], x["selection"], str(x["point"])) for x in combo]
 
-        if len(selection_keys) != len(set(selection_keys)):
+        if len(keys) != len(set(keys)):
             continue
 
-        probs = [leg["pinnacle_fair_prob"] for leg in combo]
-        decimals = [leg["fanduel_decimal"] for leg in combo]
-        evs = [leg["ev_percent"] for leg in combo]
+        base_prob = parlay_prob(combo)
+        odds_decimal = parlay_decimal(combo)
+        corr = correlation_score(combo)
 
-        base_prob = parlay_probability(probs)
-        payout_decimal = parlay_decimal_odds(decimals)
-        corr_score = correlation_score(combo)
-
-        # Conservative correlation boost cap
-        adjusted_prob = base_prob * (1 + min(max(corr_score, 0), 6) * 0.04)
+        adjusted_prob = base_prob * (1 + max(corr, 0) * 0.03)
         adjusted_prob = min(adjusted_prob, 0.95)
-
-        parlay_ev = ev_percent(adjusted_prob, payout_decimal)
 
         slips.append({
             "legs": combo,
-            "slip_size": slip_size,
-            "category": category,
             "base_probability_pct": base_prob * 100,
             "adjusted_probability_pct": adjusted_prob * 100,
-            "correlation_score": corr_score,
-            "parlay_decimal_odds": payout_decimal,
-            "parlay_american_odds": decimal_to_american(payout_decimal),
-            "average_leg_ev_pct": np.mean(evs),
-            "parlay_ev_pct": parlay_ev,
+            "parlay_decimal": odds_decimal,
+            "parlay_american": decimal_to_american(odds_decimal),
+            "correlation_score": corr,
+            "average_ev_pct": np.mean([x["ev_percent"] for x in combo]),
+            "parlay_ev_pct": ev_percent(adjusted_prob, odds_decimal),
         })
 
-    slip_df = pd.DataFrame(slips)
+    out = pd.DataFrame(slips)
 
-    if slip_df.empty:
-        return slip_df
+    if out.empty:
+        return out
 
-    if category == "highest_ev":
-        slip_df = slip_df.sort_values(
-            ["parlay_ev_pct", "correlation_score"],
-            ascending=False
-        )
-    else:
-        slip_df = slip_df.sort_values(
-            ["adjusted_probability_pct", "correlation_score"],
-            ascending=False
-        )
+    if mode == "Highest EV":
+        return out.sort_values(["parlay_ev_pct", "correlation_score"], ascending=False).head(max_slips)
 
-    return slip_df.head(max_slips)
+    return out.sort_values(["adjusted_probability_pct", "correlation_score"], ascending=False).head(max_slips)
 
 
 def format_leg(leg):
-    point = "" if pd.isna(leg["point"]) else f" {leg['point']}"
+    point = "" if pd.isna(leg["point"]) or leg["point"] is None else f" {leg['point']}"
     return (
-        f"{leg['matchup']} | "
-        f"{leg['market']} | "
-        f"{leg['selection']}{point} | "
-        f"FanDuel {leg['fanduel_american']} | "
-        f"Fair {leg['fair_american']} | "
-        f"EV {leg['ev_percent']:.2f}%"
+        f"{leg['matchup']} | {leg['market']} | {leg['selection']}{point} | "
+        f"{leg['retail_book']} {leg['retail_american']} | "
+        f"Fair {leg['fair_american']} | EV {leg['ev_percent']:.2f}%"
     )
 
 
 # -----------------------------
-# Streamlit UI
+# STREAMLIT APP
 # -----------------------------
 
 st.set_page_config(page_title="Sharp Odds + Correlation Slip Builder", layout="wide")
 
 st.title("Sharp Odds + Correlation Slip Builder")
-st.caption("FanDuel vs Pinnacle-style sharp fair odds, no-vig pricing, EV, and correlation slip generation.")
-
-api_key = st.secrets.get("ODDS_API_KEY", "")
-
-if not api_key:
-    st.error("Add your API key to .streamlit/secrets.toml as ODDS_API_KEY.")
-    st.stop()
+st.caption("Odds-API.io version: FanDuel vs Pinnacle-style sharp fair odds, no-vig pricing, EV, and correlation slips.")
 
 with st.sidebar:
     st.header("Settings")
 
-    try:
-        sports = get_sports(api_key)
-    except Exception as e:
-        st.error(f"Could not load sports: {e}")
+    leagues_raw = fetch_leagues()
+    leagues_df = normalize_leagues(leagues_raw)
+
+    if leagues_df.empty:
+        st.error("Could not load leagues from Odds-API.io.")
         st.stop()
 
-    active_sports = [s for s in sports if s.get("active")]
-    sport_map = {f"{s['title']} ({s['key']})": s["key"] for s in active_sports}
+    leagues_df = leagues_df.sort_values("title")
 
-    sport_label = st.selectbox(
-        "Sport",
-        list(sport_map.keys()),
-        index=0
-    )
+    league_options = {
+        f"{row['title']} — {row['sport']}": row["sport"]
+        for _, row in leagues_df.iterrows()
+    }
 
-    sport_key = sport_map[sport_label]
+    selected_label = st.selectbox("Sport / League", list(league_options.keys()))
+    selected_sport = league_options[selected_label]
 
-    markets = st.multiselect(
-        "Markets",
-        ["h2h", "spreads", "totals"],
-        default=["h2h", "spreads", "totals"]
-    )
+    retail_book = st.text_input("Retail book", value="fanduel")
+    sharp_book = st.text_input("Sharp book", value="pinnacle")
 
-    retail_book = st.text_input("Retail book key", value="fanduel")
-    sharp_book = st.text_input("Sharp book key", value="pinnacle")
-
+    max_events = st.slider("Events to scan", 1, 25, 8)
     slip_size = st.slider("Slip size", 2, 6, 4)
-
-    max_slips = st.slider("Number of slips", 3, 25, 10)
+    max_slips = st.slider("Number of slips", 3, 20, 8)
 
     min_ev = st.number_input("Minimum single-leg EV %", value=-100.0, step=0.5)
-
     min_prob = st.number_input("Minimum fair probability %", value=0.0, step=1.0)
 
-    refresh = st.button("Refresh Odds")
+    scan = st.button("Scan Odds")
 
-
-bookmakers = [retail_book, sharp_book]
-
-try:
-    raw = get_odds(api_key, sport_key, markets, bookmakers)
-except Exception as e:
-    st.error(f"Could not load odds: {e}")
+if not scan:
+    st.info("Choose a league, then click Scan Odds.")
     st.stop()
 
-df = normalize_odds(raw)
+events_raw = fetch_events(selected_sport)
+events_df = normalize_events(events_raw)
 
-if df.empty:
-    st.warning("No odds found. Try another sport, market, or bookmaker key.")
+if events_df.empty:
+    st.warning("No events found for this league right now.")
     st.stop()
 
-fair_df = calculate_fair_odds(
-    df,
-    retail_book=retail_book,
-    sharp_book=sharp_book
-)
+st.subheader("Events Found")
+st.dataframe(events_df.head(max_events), use_container_width=True)
 
-if fair_df.empty:
+odds_df = load_all_odds(events_df, max_events)
+
+if odds_df.empty:
+    st.warning("No odds found. Your plan may not include this league/bookmaker, or the event has no markets yet.")
+    st.stop()
+
+edges_df = calculate_edges(odds_df, retail_book, sharp_book)
+
+if edges_df.empty:
     st.warning(
-        "No matched FanDuel/Pinnacle markets found. "
-        "Try h2h, spreads, totals, or confirm your bookmaker keys are available."
+        "No matched FanDuel vs Pinnacle-style edges found. "
+        "Try changing the book names to match what appears in Raw Odds."
     )
-    st.dataframe(df)
+
+    st.subheader("Available Books Found")
+    st.write(sorted(odds_df["book_raw"].dropna().unique()))
+
+    st.subheader("Raw Odds")
+    st.dataframe(odds_df, use_container_width=True)
     st.stop()
 
-filtered = fair_df[
-    (fair_df["ev_percent"] >= min_ev) &
-    (fair_df["pinnacle_fair_prob_pct"] >= min_prob)
+filtered = edges_df[
+    (edges_df["ev_percent"] >= min_ev) &
+    (edges_df["fair_prob_pct"] >= min_prob)
 ].copy()
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -456,74 +537,64 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.subheader("Best Single Bets")
 
-    show_cols = [
+    cols = [
         "matchup",
         "market",
         "selection",
         "point",
-        "fanduel_american",
+        "retail_book",
+        "sharp_book",
+        "retail_american",
         "fair_american",
-        "pinnacle_fair_prob_pct",
-        "implied_prob_fanduel_pct",
+        "fair_prob_pct",
         "ev_percent",
     ]
 
-    st.dataframe(
-        filtered[show_cols].sort_values("ev_percent", ascending=False),
-        use_container_width=True
-    )
+    st.dataframe(filtered[cols], use_container_width=True)
 
 with tab2:
-    st.subheader("Highest Probability Correlation Slips")
+    st.subheader("Highest Probability Slips")
 
-    prob_slips = build_slips(
-        filtered,
-        category="highest_probability",
-        slip_size=slip_size,
-        max_slips=max_slips
-    )
+    slips = build_slips(filtered, slip_size, "Highest Probability", max_slips)
 
-    if prob_slips.empty:
-        st.info("No probability slips found with the current filters.")
+    if slips.empty:
+        st.info("No slips found.")
     else:
-        for i, row in prob_slips.iterrows():
+        for _, row in slips.iterrows():
             with st.expander(
-                f"Slip | Adjusted Probability {row['adjusted_probability_pct']:.2f}% | "
-                f"Odds {row['parlay_american_odds']} | Corr {row['correlation_score']}"
+                f"Probability {row['adjusted_probability_pct']:.2f}% | "
+                f"Odds {row['parlay_american']} | Corr {row['correlation_score']}"
             ):
                 st.write(f"Base probability: {row['base_probability_pct']:.2f}%")
                 st.write(f"Adjusted probability: {row['adjusted_probability_pct']:.2f}%")
                 st.write(f"Parlay EV: {row['parlay_ev_pct']:.2f}%")
-                st.write(f"Average leg EV: {row['average_leg_ev_pct']:.2f}%")
-                st.write("### Legs")
+
                 for leg in row["legs"]:
                     st.write("- " + format_leg(leg))
 
 with tab3:
-    st.subheader("Highest EV Correlation Slips")
+    st.subheader("Highest EV Slips")
 
-    ev_slips = build_slips(
-        filtered,
-        category="highest_ev",
-        slip_size=slip_size,
-        max_slips=max_slips
-    )
+    slips = build_slips(filtered, slip_size, "Highest EV", max_slips)
 
-    if ev_slips.empty:
-        st.info("No EV slips found with the current filters.")
+    if slips.empty:
+        st.info("No positive-EV slips found.")
     else:
-        for i, row in ev_slips.iterrows():
+        for _, row in slips.iterrows():
             with st.expander(
-                f"Slip | Parlay EV {row['parlay_ev_pct']:.2f}% | "
-                f"Odds {row['parlay_american_odds']} | Corr {row['correlation_score']}"
+                f"Parlay EV {row['parlay_ev_pct']:.2f}% | "
+                f"Odds {row['parlay_american']} | Corr {row['correlation_score']}"
             ):
                 st.write(f"Base probability: {row['base_probability_pct']:.2f}%")
                 st.write(f"Adjusted probability: {row['adjusted_probability_pct']:.2f}%")
-                st.write(f"Average leg EV: {row['average_leg_ev_pct']:.2f}%")
-                st.write("### Legs")
+                st.write(f"Average leg EV: {row['average_ev_pct']:.2f}%")
+
                 for leg in row["legs"]:
                     st.write("- " + format_leg(leg))
 
 with tab4:
-    st.subheader("Raw Normalized Odds")
-    st.dataframe(df, use_container_width=True)
+    st.subheader("Raw Odds")
+    st.dataframe(odds_df, use_container_width=True)
+
+    st.subheader("Books Detected")
+    st.write(sorted(odds_df["book_raw"].dropna().unique()))
